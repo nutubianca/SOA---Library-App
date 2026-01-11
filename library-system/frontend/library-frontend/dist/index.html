@@ -1,0 +1,312 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Library - SOA</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: sans-serif; background: #f5f5f5; }
+    header { background: #333; color: white; padding: 1rem; }
+    nav { display: flex; gap: 1rem; }
+    nav button { background: none; border: none; color: white; cursor: pointer; font-size: 1rem; }
+    main { max-width: 1200px; margin: 2rem auto; padding: 0 1rem; }
+    .card { background: white; padding: 1.5rem; margin: 1rem 0; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    form { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 1rem; }
+    input, button { padding: 0.5rem; font-size: 1rem; border: 1px solid #ddd; border-radius: 4px; }
+    button { background: #007bff; color: white; cursor: pointer; border: none; }
+    button:hover { background: #0056b3; }
+    .hidden { display: none; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 1rem; }
+    .book-card { background: white; padding: 1rem; border: 1px solid #ddd; border-radius: 4px; }
+    .notification { background: #d4edda; color: #155724; padding: 1rem; margin: 0.5rem 0; border-radius: 4px; }
+    .error { background: #f8d7da; color: #721c24; }
+    #notifications { position: fixed; bottom: 1rem; right: 1rem; max-width: 400px; max-height: 300px; overflow-y: auto; }
+  </style>
+</head>
+<body>
+  <header>
+    <nav>
+      <h1>📚 Library SOA</h1>
+      <button id="btnLogin" onclick="showLogin()">Login</button>
+      <button id="btnBooks" onclick="showBooks()" class="hidden">Browse Books</button>
+      <button id="btnMyBorrows" onclick="showMyBorrows()" class="hidden">My Borrows</button>
+      <button id="btnLogout" onclick="logout()" class="hidden">Logout</button>
+      <span id="userDisplay"></span>
+    </nav>
+  </header>
+
+  <main>
+    <!-- Login/Register -->
+    <div id="loginSection" class="card">
+      <h2>Login / Register</h2>
+      <form onsubmit="handleAuth(event)">
+        <input type="email" id="email" placeholder="Email" required />
+        <input type="password" id="password" placeholder="Password" required />
+        <input type="text" id="name" placeholder="Full Name (register only)" />
+        <button type="submit" id="authBtn">Login</button>
+      </form>
+      <p id="authMessage"></p>
+    </div>
+
+    <!-- Books Section -->
+    <div id="booksSection" class="hidden card">
+      <h2>Browse Books</h2>
+      <input type="text" id="searchBooks" placeholder="Search by title or author..." />
+      <button onclick="searchBooks()">Search</button>
+      <div id="booksList" class="grid"></div>
+    </div>
+
+    <!-- My Borrows -->
+    <div id="borrowsSection" class="hidden card">
+      <h2>My Borrowed Books</h2>
+      <div id="borrowsList"></div>
+    </div>
+  </main>
+
+  <div id="notifications"></div>
+
+  <script>
+    const API_BASE = 'http://localhost:8080';
+    let token = localStorage.getItem('token');
+    let userId = localStorage.getItem('userId');
+    let ws;
+
+    function updateUI() {
+      const isLoggedIn = !!token;
+      document.getElementById('btnLogin').classList.toggle('hidden', isLoggedIn);
+      document.getElementById('btnBooks').classList.toggle('hidden', !isLoggedIn);
+      document.getElementById('btnMyBorrows').classList.toggle('hidden', !isLoggedIn);
+      document.getElementById('btnLogout').classList.toggle('hidden', !isLoggedIn);
+      document.getElementById('loginSection').classList.toggle('hidden', isLoggedIn);
+      if (isLoggedIn) {
+        const userName = localStorage.getItem('userName');
+        document.getElementById('userDisplay').textContent = userName ? `Welcome, ${userName}` : '';
+        connectWebSocket();
+      }
+    }
+
+    function connectWebSocket() {
+      ws = new WebSocket('ws://localhost:3003');
+      ws.onopen = () => {
+        console.log('WebSocket connected');
+        addNotification('Connected to notifications', 'success');
+      };
+      ws.onmessage = async (evt) => {
+        const msg = JSON.parse(evt.data);
+        addNotification(`📢 ${msg.type}: Book ${msg.data.book_id}`, 'success');
+        // If a book was borrowed or returned, refresh the book list if visible
+        if (msg.type === 'book.borrowed' || msg.type === 'book.returned') {
+          const booksSection = document.getElementById('booksSection');
+          if (booksSection && !booksSection.classList.contains('hidden')) {
+            await loadBooks();
+          }
+        }
+      };
+      ws.onerror = () => addNotification('WebSocket error', 'error');
+    }
+
+    function addNotification(text, type = 'info') {
+      const div = document.createElement('div');
+      div.className = `notification ${type === 'error' ? 'error' : ''}`;
+      div.textContent = text;
+      document.getElementById('notifications').appendChild(div);
+      setTimeout(() => div.remove(), 5000);
+    }
+
+    // Helper to safely fetch JSON and handle HTML/error responses
+    async function fetchJson(url, options = {}) {
+      // attach auth header when token is present
+      options = options || {};
+      options.headers = options.headers || {};
+      if (token && !options.headers.Authorization && !options.headers.authorization) {
+        options.headers.Authorization = 'Bearer ' + token;
+      }
+      const res = await fetch(url, options);
+      const contentType = res.headers.get('content-type') || '';
+      if (!res.ok) {
+        const text = await res.text();
+        let body = text;
+        if (contentType.includes('application/json')) {
+          try { body = JSON.parse(text); } catch (e) { /* ignore */ }
+        }
+        if (res.status === 401) {
+          // clear auth and redirect to login
+          logout();
+          throw new Error((body && (body.error || body.message)) || 'Unauthorized');
+        }
+        throw new Error((body && (body.error || body.message)) || text || `HTTP ${res.status}`);
+      }
+      if (contentType.includes('application/json')) return await res.json();
+      return await res.text();
+    }
+
+    async function handleAuth(e) {
+      e.preventDefault();
+      const email = document.getElementById('email').value;
+      const password = document.getElementById('password').value;
+      const name = document.getElementById('name').value;
+      
+      try {
+        const isRegister = name.trim().length > 0;
+        const endpoint = isRegister ? '/userapi/register' : '/userapi/login';
+        const body = isRegister ? { name, email, password } : { email, password };
+        
+        const data = await fetchJson(`${API_BASE}${endpoint}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        if (isRegister) {
+          // Registration successful
+          document.getElementById('authMessage').textContent = 'Account created! Please login with your credentials.';
+          document.getElementById('name').value = '';
+          document.getElementById('email').value = '';
+          document.getElementById('password').value = '';
+        } else {
+          // Login successful
+          if (data.token) {
+            token = data.token;
+            userId = data.user.id;
+            localStorage.setItem('token', token);
+            localStorage.setItem('userId', userId);
+            if (data.user.name) localStorage.setItem('userName', data.user.name);
+            document.getElementById('authMessage').textContent = 'Login successful!';
+            document.getElementById('email').value = '';
+            document.getElementById('password').value = '';
+            updateUI();
+            showBooks();
+          } else {
+            document.getElementById('authMessage').textContent = 'Login error: No token received';
+          }
+        }
+      } catch (err) {
+        document.getElementById('authMessage').textContent = 'Error: ' + err.message;
+      }
+    }
+
+    async function showBooks() {
+      document.getElementById('booksSection').classList.remove('hidden');
+      document.getElementById('borrowsSection').classList.add('hidden');
+      await loadBooks();
+    }
+
+    async function loadBooks() {
+      try {
+        const data = await fetchJson(`${API_BASE}/bookapi/books?limit=20`);
+        const html = data.books.map(b => `
+          <div class="book-card">
+            <h3>${b.title}</h3>
+            <p>Author: ${b.author}</p>
+            <p>Available: ${b.copies_available}/${b.copies_total}</p>
+            <button ${b.copies_available > 0 ? '' : 'disabled'} onclick="borrowBook(${b.id})">
+              ${b.copies_available > 0 ? 'Borrow' : 'Not Available'}
+            </button>
+          </div>
+        `).join('');
+        document.getElementById('booksList').innerHTML = html;
+      } catch (err) {
+        addNotification('Error loading books: ' + err.message, 'error');
+      }
+    }
+
+    async function searchBooks() {
+      const q = document.getElementById('searchBooks').value;
+      if (!q) return loadBooks();
+      try {
+        let books = await fetchJson(`${API_BASE}/bookapi/books/search/${encodeURIComponent(q)}`);
+        // Handle both array and {books:[]} response
+        if (books && books.books) books = books.books;
+        if (!Array.isArray(books)) books = [];
+        const html = books.map(b => `
+          <div class="book-card">
+            <h3>${b.title}</h3>
+            <p>Author: ${b.author}</p>
+            <p>Available: ${b.copies_available ?? '-'} / ${b.copies_total ?? '-'}</p>
+            <button ${b.copies_available > 0 ? '' : 'disabled'} onclick="borrowBook(${b.id})">
+              ${b.copies_available > 0 ? 'Borrow' : 'Not Available'}
+            </button>
+          </div>
+        `).join('');
+        document.getElementById('booksList').innerHTML = html || '<p>No books found.</p>';
+      } catch (err) {
+        addNotification('Search error: ' + err.message, 'error');
+      }
+    }
+
+    async function borrowBook(bookId) {
+      try {
+        const res = await fetch(`${API_BASE}/borrowapi/borrow`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ user_id: userId, book_id: bookId, due_days: 14 })
+        });
+        if (!res.ok) {
+          const text = await res.text();
+          throw new Error(text || 'Borrow failed');
+        }
+        addNotification(`📖 Book ${bookId} borrowed!`, 'success');
+        await loadBooks();
+      } catch (err) {
+        addNotification('Borrow error: ' + err.message, 'error');
+      }
+    }
+
+    async function showMyBorrows() {
+      document.getElementById('booksSection').classList.add('hidden');
+      document.getElementById('borrowsSection').classList.remove('hidden');
+      try {
+        const borrows = await fetchJson(`${API_BASE}/borrowapi/borrows/${userId}`);
+        const html = borrows.map(b => `
+          <div class="card">
+            <h3>${b.title}</h3>
+            <p>Author: ${b.author}</p>
+            <p>Borrowed: ${new Date(b.borrowed_at).toLocaleDateString()}</p>
+            <p>Due: ${new Date(b.due_at).toLocaleDateString()}</p>
+            ${!b.returned_at
+              ? `<button onclick="returnBook(${b.id})">Return</button>`
+              : `<p>✓ Returned on ${new Date(b.returned_at).toLocaleDateString()}</p>`}
+          </div>
+        `).join('');
+        document.getElementById('borrowsList').innerHTML = html || '<p>No active borrows</p>';
+      } catch (err) {
+        addNotification('Error loading borrows: ' + err.message, 'error');
+      }
+    }
+
+    async function returnBook(borrowId) {
+      try {
+        const res = await fetch(`${API_BASE}/borrowapi/return`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ borrow_id: borrowId })
+        });
+        if (!res.ok) {
+          const text = await res.text();
+          throw new Error(text || 'Return failed');
+        }
+        addNotification('📚 Book returned!', 'success');
+        await showMyBorrows();
+      } catch (err) {
+        addNotification('Return error: ' + err.message, 'error');
+      }
+    }
+
+    function logout() {
+      token = null;
+      userId = null;
+      localStorage.clear();
+      if (ws) ws.close();
+      updateUI();
+    }
+
+    function showLogin() {
+      document.getElementById('loginSection').classList.remove('hidden');
+      document.getElementById('booksSection').classList.add('hidden');
+      document.getElementById('borrowsSection').classList.add('hidden');
+    }
+
+    updateUI();
+  </script>
+</body>
+</html>

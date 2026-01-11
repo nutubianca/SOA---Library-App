@@ -1,0 +1,91 @@
+version: '3.8'
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: library
+      POSTGRES_PASSWORD: library
+      POSTGRES_DB: library
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./postgresql.conf:/etc/postgresql/postgresql.conf:ro
+    ports:
+      - '5432:5432'
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-postgres} || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf", "-c", "log_connections=on", "-c", "log_disconnections=on"]
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - '15673:15672'
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  nginx:
+    image: nginx:stable-alpine
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ../frontend/library-frontend/dist:/usr/share/nginx/html:ro
+    ports:
+      - '8080:80'
+    depends_on:
+      - userapi
+      - bookapi
+      - borrowapi
+      - notificationapi
+
+  userapi:
+    build: ./UserAPI
+    ports:
+      - '3000:3000'
+    environment:
+      - DATABASE_URL=postgres://library:library@postgres:5432/library
+      - RABBITMQ_URL=amqp://rabbitmq
+    depends_on:
+      - postgres
+      - rabbitmq
+
+  bookapi:
+    build: ./BookAPI
+    ports:
+      - '3001:3001'
+    environment:
+      - DATABASE_URL=postgres://library:library@postgres:5432/library
+      - RABBITMQ_URL=amqp://rabbitmq
+    depends_on:
+      - postgres
+      - rabbitmq
+
+  borrowapi:
+    build: ./BorrowAPI
+    ports:
+      - '3002:3002'
+    environment:
+      - DATABASE_URL=postgres://library:library@postgres:5432/library
+      - RABBITMQ_URL=amqp://rabbitmq
+    depends_on:
+      - postgres
+      - rabbitmq
+
+  notificationapi:
+    build: ./NotificationAPI
+    ports:
+      - '3003:3003'
+    environment:
+      - RABBITMQ_URL=amqp://rabbitmq
+    depends_on:
+      - rabbitmq
+
+volumes:
+  pgdata:
