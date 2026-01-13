@@ -1,6 +1,8 @@
+
 const express = require('express');
 const { Pool } = require('pg');
 const cors = require('cors');
+const jwt = require('jsonwebtoken');
 
 const app = express();
 app.use(express.json());
@@ -9,6 +11,20 @@ app.use(cors());
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL || 'postgres://library:library@postgres:5432/librarydb'
 });
+
+const JWT_SECRET = process.env.JWT_SECRET || 'library-secret-key-change-in-prod';
+
+function authMiddleware(req, res, next) {
+  const auth = req.headers.authorization;
+  if (!auth) return res.status(401).json({ error: 'Missing token' });
+  const token = auth.split(' ')[1];
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch (err) {
+    res.status(401).json({ error: 'Invalid token' });
+  }
+}
 
 app.get('/health', (req, res) => res.json({ status: 'ok', service: 'BookAPI' }));
 
@@ -54,12 +70,12 @@ app.get('/books/:id', async (req, res) => {
   }
 });
 
-// Create book
-app.post('/books', async (req, res) => {
+
+// Create book (protected)
+app.post('/books', authMiddleware, async (req, res) => {
   try {
     const { title, author, isbn, description, copies_total } = req.body;
     if (!title || !author) return res.status(400).json({ error: 'Missing title/author' });
-    
     const result = await pool.query(
       'INSERT INTO books (title, author, isbn, description, copies_total, copies_available) VALUES ($1, $2, $3, $4, $5, $5) RETURNING *',
       [title, author, isbn, description, copies_total || 1]
@@ -70,8 +86,8 @@ app.post('/books', async (req, res) => {
   }
 });
 
-// Update book
-app.put('/books/:id', async (req, res) => {
+// Update book (protected)
+app.put('/books/:id', authMiddleware, async (req, res) => {
   try {
     const { title, author, description, copies_total } = req.body;
     const result = await pool.query(
@@ -85,8 +101,8 @@ app.put('/books/:id', async (req, res) => {
   }
 });
 
-// Delete book
-app.delete('/books/:id', async (req, res) => {
+// Delete book (protected)
+app.delete('/books/:id', authMiddleware, async (req, res) => {
   try {
     const result = await pool.query('DELETE FROM books WHERE id = $1 RETURNING id', [req.params.id]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'Book not found' });

@@ -1,15 +1,13 @@
 {
-  "name": "bookapi",
+  "name": "faas-api",
   "version": "1.0.0",
+  "private": true,
   "main": "index.js",
-  "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "express": "^5.2.1",
-    "pg": "^8.16.3",
     "cors": "^2.8.5",
-    "jsonwebtoken": "^9.0.2"
+    "express": "^4.21.2"
   }
 }

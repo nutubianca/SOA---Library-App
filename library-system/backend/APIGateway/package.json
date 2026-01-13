@@ -1,5 +1,5 @@
 {
-  "name": "borrowapi",
+  "name": "apigateway",
   "version": "1.0.0",
   "main": "index.js",
   "type": "commonjs",
@@ -8,10 +8,8 @@
   },
   "dependencies": {
     "express": "^5.2.1",
-    "pg": "^8.16.3",
+    "http-proxy-middleware": "^2.0.6",
     "cors": "^2.8.5",
-    "amqplib": "^0.10.3",
-    "kafkajs": "^2.2.4",
-    "jsonwebtoken": "^9.0.2"
+    "jsonwebtoken": "^9.0.3"
   }
 }

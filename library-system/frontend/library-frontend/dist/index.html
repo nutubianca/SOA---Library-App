@@ -22,6 +22,7 @@
     .notification { background: #d4edda; color: #155724; padding: 1rem; margin: 0.5rem 0; border-radius: 4px; }
     .error { background: #f8d7da; color: #721c24; }
     #notifications { position: fixed; bottom: 1rem; right: 1rem; max-width: 400px; max-height: 300px; overflow-y: auto; }
+    .row { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: 0.5rem; }
   </style>
 </head>
 <body>
@@ -54,6 +55,11 @@
       <h2>Browse Books</h2>
       <input type="text" id="searchBooks" placeholder="Search by title or author..." />
       <button onclick="searchBooks()">Search</button>
+      <div class="row" style="margin-top: 0.75rem; align-items: center;">
+        <label for="dueDays" style="min-width: 90px;">Due days:</label>
+        <input type="number" id="dueDays" min="1" max="90" value="14" style="width: 110px;" oninput="updateDuePreview()" />
+        <span id="duePreview" style="color:#555;"></span>
+      </div>
       <div id="booksList" class="grid"></div>
     </div>
 
@@ -71,6 +77,9 @@
     let token = localStorage.getItem('token');
     let userId = localStorage.getItem('userId');
     let ws;
+    let sseAbort;
+    let booksCache = new Map();
+    let borrowsCache = new Map();
 
     function updateUI() {
       const isLoggedIn = !!token;
@@ -82,29 +91,116 @@
       if (isLoggedIn) {
         const userName = localStorage.getItem('userName');
         document.getElementById('userDisplay').textContent = userName ? `Welcome, ${userName}` : '';
-        connectWebSocket();
+        connectNotifications();
+      } else {
+        document.getElementById('userDisplay').textContent = '';
+        document.getElementById('booksSection').classList.add('hidden');
+        document.getElementById('borrowsSection').classList.add('hidden');
+        document.getElementById('booksList').innerHTML = '';
+        document.getElementById('borrowsList').innerHTML = '';
+        disconnectNotifications();
       }
     }
 
-    function connectWebSocket() {
-      ws = new WebSocket('ws://localhost:3003');
-      ws.onopen = () => {
-        console.log('WebSocket connected');
+    async function invokeFaas(name, input) {
+      return await fetchJson(`${API_BASE}/faasapi/invoke/${encodeURIComponent(name)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(input || {})
+      });
+    }
+
+    function disconnectNotifications() {
+      if (sseAbort) {
+        try { sseAbort.abort(); } catch (e) { /* ignore */ }
+        sseAbort = null;
+      }
+      if (ws) {
+        try { ws.close(); } catch (e) { /* ignore */ }
+        ws = null;
+      }
+    }
+
+    function connectNotifications() {
+      // Prefer SSE because it works cleanly through the API Gateway + NGINX with JWT headers.
+      disconnectNotifications();
+      if (!token) return;
+      connectSSE();
+    }
+
+    async function connectSSE() {
+      sseAbort = new AbortController();
+      try {
+        const res = await fetch(`${API_BASE}/notificationapi/events`, {
+          method: 'GET',
+          headers: { Authorization: 'Bearer ' + token },
+          signal: sseAbort.signal
+        });
+        if (!res.ok) {
+          const text = await res.text();
+          throw new Error(text || `SSE HTTP ${res.status}`);
+        }
         addNotification('Connected to notifications', 'success');
-      };
-      ws.onmessage = async (evt) => {
-        const msg = JSON.parse(evt.data);
-        addNotification(`📢 ${msg.type}: Book ${msg.data.book_id}`, 'success');
-        // If a book was borrowed or returned, refresh the book list if visible
-        if (msg.type === 'book.borrowed' || msg.type === 'book.returned') {
-          const booksSection = document.getElementById('booksSection');
-          if (booksSection && !booksSection.classList.contains('hidden')) {
-            await loadBooks();
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+
+          // SSE events are separated by blank lines
+          const parts = buffer.split('\n\n');
+          buffer = parts.pop() || '';
+
+          for (const chunk of parts) {
+            const lines = chunk.split('\n');
+            let eventType = 'message';
+            const dataLines = [];
+            for (const line of lines) {
+              if (line.startsWith('event:')) eventType = line.slice(6).trim();
+              if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
+            }
+            if (!dataLines.length) continue;
+            const dataStr = dataLines.join('\n');
+
+            if (eventType === 'ping' || eventType === 'connected') continue;
+
+            try {
+              const payload = JSON.parse(dataStr);
+              if (payload && payload.type && payload.data) {
+                const title = payload.data.title;
+                const author = payload.data.author;
+                const bookId = payload.data.book_id;
+                const bookLabel = title ? `${title}${author ? ` — ${author}` : ''}` : `Book ${bookId}`;
+                const action = payload.type === 'book.borrowed'
+                  ? 'Borrowed'
+                  : payload.type === 'book.returned'
+                    ? 'Returned'
+                    : payload.type;
+                addNotification(`📢 ${action}: ${bookLabel}`, 'success');
+                if (payload.type === 'book.borrowed' || payload.type === 'book.returned') {
+                  const booksSection = document.getElementById('booksSection');
+                  if (booksSection && !booksSection.classList.contains('hidden')) {
+                    await loadBooks();
+                  }
+                }
+              }
+            } catch (e) {
+              // ignore parse failures
+            }
           }
         }
-      };
-      ws.onerror = () => addNotification('WebSocket error', 'error');
+      } catch (err) {
+        if (err.name === 'AbortError') return;
+        addNotification('Notifications disconnected: ' + err.message, 'error');
+      }
     }
+
+    // WebSocket support is intentionally not used here;
+    // SSE via /notificationapi/events works through the gateway with JWT headers.
 
     function addNotification(text, type = 'info') {
       const div = document.createElement('div');
@@ -188,12 +284,45 @@
     async function showBooks() {
       document.getElementById('booksSection').classList.remove('hidden');
       document.getElementById('borrowsSection').classList.add('hidden');
+      updateDuePreview();
       await loadBooks();
+    }
+
+    function getDueDays() {
+      const el = document.getElementById('dueDays');
+      const days = Number(el?.value);
+      if (!Number.isFinite(days)) return 14;
+      const wholeDays = Math.trunc(days);
+      if (wholeDays < 1) return 1;
+      if (wholeDays > 90) return 90;
+      return wholeDays;
+    }
+
+    async function updateDuePreview() {
+      const preview = document.getElementById('duePreview');
+      if (!preview) return;
+
+      const days = getDueDays();
+      preview.textContent = 'Calculating due date...';
+
+      try {
+        // Real usage of FaaS: ask the FaaS service to compute the due date.
+        // Uses JWT automatically via fetchJson().
+        const result = await invokeFaas('dueDate', { days });
+        const dueAt = result?.output?.due_at;
+        const dueDateLocal = dueAt ? new Date(dueAt).toLocaleDateString() : '';
+        preview.textContent = dueDateLocal ? `Due date: ${dueDateLocal}` : '';
+      } catch (err) {
+        // Fallback: don't block borrowing if FaaS is unavailable
+        const due = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
+        preview.textContent = `Due date: ${due.toLocaleDateString()}`;
+      }
     }
 
     async function loadBooks() {
       try {
         const data = await fetchJson(`${API_BASE}/bookapi/books?limit=20`);
+        booksCache = new Map((data.books || []).map(b => [b.id, b]));
         const html = data.books.map(b => `
           <div class="book-card">
             <h3>${b.title}</h3>
@@ -218,6 +347,7 @@
         // Handle both array and {books:[]} response
         if (books && books.books) books = books.books;
         if (!Array.isArray(books)) books = [];
+        booksCache = new Map(books.map(b => [b.id, b]));
         const html = books.map(b => `
           <div class="book-card">
             <h3>${b.title}</h3>
@@ -236,16 +366,13 @@
 
     async function borrowBook(bookId) {
       try {
-        const res = await fetch(`${API_BASE}/borrowapi/borrow`, {
+        const dueDays = getDueDays();
+        await fetchJson(`${API_BASE}/borrowapi/borrow`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ user_id: userId, book_id: bookId, due_days: 14 })
+          body: JSON.stringify({ user_id: userId, book_id: bookId, due_days: dueDays })
         });
-        if (!res.ok) {
-          const text = await res.text();
-          throw new Error(text || 'Borrow failed');
-        }
-        addNotification(`📖 Book ${bookId} borrowed!`, 'success');
+        // Success notifications come from SSE (/notificationapi/events)
         await loadBooks();
       } catch (err) {
         addNotification('Borrow error: ' + err.message, 'error');
@@ -257,12 +384,40 @@
       document.getElementById('borrowsSection').classList.remove('hidden');
       try {
         const borrows = await fetchJson(`${API_BASE}/borrowapi/borrows/${userId}`);
+        borrowsCache = new Map((borrows || []).map(b => [b.id, b]));
+
+        // Real FaaS integration: compute days remaining via FaaS based on due_at.
+        let dueInfoByIndex = [];
+        try {
+          const dates = (borrows || []).map(b => b.due_at);
+          const faas = await invokeFaas('daysUntil', { dates });
+          if (Array.isArray(faas?.output)) dueInfoByIndex = faas.output;
+        } catch (e) {
+          // Fallback: compute locally if FaaS is unavailable
+          dueInfoByIndex = (borrows || []).map(b => {
+            const to = new Date(b.due_at);
+            const ms = to.getTime() - Date.now();
+            const days = Math.ceil(ms / (24 * 60 * 60 * 1000));
+            return { days, overdue: days < 0 };
+          });
+        }
+
         const html = borrows.map(b => `
           <div class="card">
             <h3>${b.title}</h3>
             <p>Author: ${b.author}</p>
             <p>Borrowed: ${new Date(b.borrowed_at).toLocaleDateString()}</p>
             <p>Due: ${new Date(b.due_at).toLocaleDateString()}</p>
+            ${!b.returned_at ? (() => {
+              const idx = (borrows || []).findIndex(x => x.id === b.id);
+              const info = dueInfoByIndex[idx];
+              if (!info || typeof info.days !== 'number') return '';
+              const label = info.overdue
+                ? `Overdue by ${Math.abs(info.days)} day(s)`
+                : `${info.days} day(s) remaining`;
+              const color = info.overdue ? '#b00020' : '#155724';
+              return `<p style="color:${color}; font-weight:600;">${label}</p>`;
+            })() : ''}
             ${!b.returned_at
               ? `<button onclick="returnBook(${b.id})">Return</button>`
               : `<p>✓ Returned on ${new Date(b.returned_at).toLocaleDateString()}</p>`}
@@ -276,16 +431,12 @@
 
     async function returnBook(borrowId) {
       try {
-        const res = await fetch(`${API_BASE}/borrowapi/return`, {
+        await fetchJson(`${API_BASE}/borrowapi/return`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ borrow_id: borrowId })
         });
-        if (!res.ok) {
-          const text = await res.text();
-          throw new Error(text || 'Return failed');
-        }
-        addNotification('📚 Book returned!', 'success');
+        // Success notifications come from SSE (/notificationapi/events)
         await showMyBorrows();
       } catch (err) {
         addNotification('Return error: ' + err.message, 'error');
@@ -295,15 +446,41 @@
     function logout() {
       token = null;
       userId = null;
-      localStorage.clear();
-      if (ws) ws.close();
+      localStorage.removeItem('token');
+      localStorage.removeItem('userId');
+      localStorage.removeItem('userName');
+      const authMsg = document.getElementById('authMessage');
+      if (authMsg) authMsg.textContent = '';
+      disconnectNotifications();
+      showLogin();
       updateUI();
     }
+
+    // Keep multiple tabs in sync: if one tab logs out, others should immediately reset UI
+    window.addEventListener('storage', (e) => {
+      if (e.key === 'token' && !e.newValue) {
+        token = null;
+        userId = null;
+        disconnectNotifications();
+        showLogin();
+        updateUI();
+      }
+      // Some browsers emit a single event with key === null on clear(); handle that too
+      if (e.key === null && !localStorage.getItem('token')) {
+        token = null;
+        userId = null;
+        disconnectNotifications();
+        showLogin();
+        updateUI();
+      }
+    });
 
     function showLogin() {
       document.getElementById('loginSection').classList.remove('hidden');
       document.getElementById('booksSection').classList.add('hidden');
       document.getElementById('borrowsSection').classList.add('hidden');
+      const authMsg = document.getElementById('authMessage');
+      if (authMsg) authMsg.textContent = '';
     }
 
     updateUI();
